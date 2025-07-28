@@ -7,7 +7,7 @@ Your range is 73 bits
 so we have 72 bits
 
 now each thread starting from 0 will have from 1 to 71 bits, they are permanent on each thread
-the only thing that happens to them is that they being shuffled AND transformed, so this way a "Mirror" could be found
+the only thing that happens to them is that they being shuffled AND transformed, so this way a "mirror" can be found when vertical transforming
 
 # This Bitcoin Puzzle searcher Uses GPU with transformations
 
