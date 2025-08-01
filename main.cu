@@ -1457,47 +1457,50 @@ __global__ void start_optimized(const char* minRangePure, const char* maxRangePu
         for(int inv = 0; inv < 2; inv++) {
             for(int z = 0; z < 2; z++) {
                 for(int y = 0; y < length; y++) {
+					for(int x = 0; x < 16; x++) {
 
-                    binary_to_bigint_direct(binary, &priv2);
-                    
-                    if (compare_bigint(&priv2, &const_n) >= 0) {
-                        ptx_u256Sub(&priv, &priv2, &const_n);
-                    } else {
-                        copy_bigint(&priv, &priv2);
-                    }
-                    
-                    scalar_multiply_jac_device(&result_jac, &const_G_jacobian, &priv);
-                    jacobian_to_affine(&public_key, &result_jac);
-                    coords_to_compressed_pubkey(public_key.x, public_key.y, pubkey);
-                    hash160(pubkey, 33, hash160_out);
-                    
-                    
-                    // Debug output for specific thread
-                    if(tid == 0 && inv == 0 && z == 0 && y == 0) {
-                        hash160_to_hex(hash160_out, hash160_str);
-                        char hex_str[65];
-                        bigint_to_hex(&priv, hex_str);
-                        printf("%d - %s -> %s -> %s\n", c, binary, hex_str, hash160_str);
-                    }
-                    
-                    // Check if we found the target
-                    if (compare_hash160_fast(hash160_out, target_bytes)) {
-                        if (atomicCAS((int*)&g_found, 0, 1) == 0) {
-                            // Only convert to hex when found
-                            binary_to_hex(binary, temp_hex);
-                            hash160_to_hex(hash160_out, hash160_str);
-                            
-                            memcpy(g_found_hex, temp_hex, 65);
-                            memcpy(g_found_hash160, hash160_str, 41);
-                            
-                            printf("\n*** FOUND! ***\n");
-                            printf("Private Key: %s\n", temp_hex);
-                            printf("Hash160: %s\n", hash160_str);
-                        }
-                        local_found = 1;
-                        goto exit_loops; // Break all nested loops efficiently
-                    }
-                    
+						binary_to_bigint_direct(binary, &priv2);
+						
+						if (compare_bigint(&priv2, &const_n) >= 0) {
+							ptx_u256Sub(&priv, &priv2, &const_n);
+						} else {
+							copy_bigint(&priv, &priv2);
+						}
+						
+						scalar_multiply_jac_device(&result_jac, &const_G_jacobian, &priv);
+						jacobian_to_affine(&public_key, &result_jac);
+						coords_to_compressed_pubkey(public_key.x, public_key.y, pubkey);
+						hash160(pubkey, 33, hash160_out);
+						
+						
+						// Debug output for specific thread
+						if(tid == 0 && inv == 0 && z == 0 && y == 0 && x == 0) {
+							hash160_to_hex(hash160_out, hash160_str);
+							char hex_str[65];
+							bigint_to_hex(&priv, hex_str);
+							printf("%d - %s -> %s -> %s\n", c, binary, hex_str, hash160_str);
+						}
+						
+						// Check if we found the target
+						if (compare_hash160_fast(hash160_out, target_bytes)) {
+							if (atomicCAS((int*)&g_found, 0, 1) == 0) {
+								// Only convert to hex when found
+								binary_to_hex(binary, temp_hex);
+								hash160_to_hex(hash160_out, hash160_str);
+								
+								memcpy(g_found_hex, temp_hex, 65);
+								memcpy(g_found_hash160, hash160_str, 41);
+								
+								printf("\n*** FOUND! ***\n");
+								printf("Private Key: %s\n", temp_hex);
+								printf("Hash160: %s\n", hash160_str);
+							}
+							local_found = 1;
+							goto exit_loops; // Break all nested loops efficiently
+						}
+						binary_vertical_rotate_up(binary);
+					}
+							 
                     binary_rotate_left_by_one(binary);
                 }
                 reverseBinaryAfterFirst1(binary);
