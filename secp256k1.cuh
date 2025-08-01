@@ -148,75 +148,108 @@ __device__ __forceinline__ void convert_9word_to_bigint(const uint32_t r[9], Big
         res->data[i] = r[i];
     }
 }
-
 __device__ __forceinline__ void mul_mod_device(BigInt *res, const BigInt *a, const BigInt *b) {
-    uint32_t prod[2 * BIGINT_WORDS] = {0};
+    uint32_t prod[16] = {0};
     
-    // Multiplication phase - optimized with unrolling
+    // Multiplication phase - exactly as original but with better unrolling
     #pragma unroll
-    for (int i = 0; i < BIGINT_WORDS; i++) {
+    for (int i = 0; i < 8; i++) {
         uint64_t carry = 0;
         uint32_t ai = a->data[i];
         
         #pragma unroll
-        for (int j = 0; j < BIGINT_WORDS; j++) {
+        for (int j = 0; j < 8; j++) {
             uint64_t tmp = (uint64_t)prod[i + j] + (uint64_t)ai * b->data[j] + carry;
             prod[i + j] = (uint32_t)tmp;
             carry = tmp >> 32;
         }
-        prod[i + BIGINT_WORDS] += (uint32_t)carry;
+        prod[i + 8] += (uint32_t)carry;
     }
     
-    // Split into L and H
+    // Split into L and H - exactly as original
     BigInt L, H;
     #pragma unroll
-    for (int i = 0; i < BIGINT_WORDS; i++) {
+    for (int i = 0; i < 8; i++) {
         L.data[i] = prod[i];
-        H.data[i] = prod[i + BIGINT_WORDS];
+        H.data[i] = prod[i + 8];
     }
     
-    // Initialize Rext with L
-    uint32_t Rext[9] = {0};
+    // Initialize Rext with L - exactly as original
+    uint32_t Rext[9];
     #pragma unroll
-    for (int i = 0; i < BIGINT_WORDS; i++) {
+    for (int i = 0; i < 8; i++) {
         Rext[i] = L.data[i];
     }
     Rext[8] = 0;
     
-    // Add H * 977
-    uint32_t H977[9] = {0};
-    multiply_bigint_by_const(&H, 977, H977);
-    add_9word(Rext, H977);
+    // Add H * 977 - optimized version of multiply_bigint_by_const
+    {
+        uint64_t carry = 0;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            uint64_t prod = (uint64_t)H.data[i] * 977 + carry;
+            uint64_t sum = (uint64_t)Rext[i] + (uint32_t)prod;
+            Rext[i] = (uint32_t)sum;
+            carry = (prod >> 32) + (sum >> 32);
+        }
+        Rext[8] += (uint32_t)carry;
+    }
 
-    // Add H shifted by one word (H * 2^32)
-    uint32_t Hshift[9] = {0};
-    shift_left_word(&H, Hshift);
-    add_9word(Rext, Hshift);
+    // Add H shifted by one word (H * 2^32) - optimized add
+    {
+        uint64_t carry = 0;
+        // Rext[0] stays the same (shift left means add 0 at position 0)
+        #pragma unroll
+        for (int i = 1; i < 9; i++) {
+            uint64_t sum = (uint64_t)Rext[i] + (i <= 8 ? H.data[i-1] : 0) + carry;
+            Rext[i] = (uint32_t)sum;
+            carry = sum >> 32;
+        }
+        // Note: any final carry is absorbed into Rext[8]
+    }
     
     // Handle overflow exactly as in original
     if (Rext[8]) {
-        uint32_t extra[9] = {0};
         BigInt extraBI;
         init_bigint(&extraBI, Rext[8]);
         Rext[8] = 0;
         
-        uint32_t extra977[9] = {0}, extraShift[9] = {0};
-        multiply_bigint_by_const(&extraBI, 977, extra977);
-        shift_left_word(&extraBI, extraShift);
+        // Compute extra977 = extraBI * 977
+        uint64_t carry = 0;
+        uint32_t extra977[9] = {0};
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            uint64_t prod = (uint64_t)extraBI.data[i] * 977 + carry;
+            extra977[i] = (uint32_t)prod;
+            carry = prod >> 32;
+        }
+        extra977[8] = (uint32_t)carry;
         
+        // Compute extraShift = extraBI << 32
+        uint32_t extraShift[9] = {0};
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            extraShift[i+1] = extraBI.data[i];
+        }
+        
+        // Add both to Rext
+        carry = 0;
         #pragma unroll
         for (int i = 0; i < 9; i++) {
-            extra[i] = extra977[i];
+            uint64_t sum = (uint64_t)Rext[i] + extra977[i] + extraShift[i] + carry;
+            Rext[i] = (uint32_t)sum;
+            carry = sum >> 32;
         }
-        add_9word(extra, extraShift);
-        add_9word(Rext, extra);
     }
     
     // Convert back to BigInt
     BigInt R_temp;
-    convert_9word_to_bigint(Rext, &R_temp);
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        R_temp.data[i] = Rext[i];
+    }
     
-    // Final reductions
+    // Final reductions - exactly as original
     if (Rext[8] || compare_bigint(&R_temp, &const_p) >= 0) {
         ptx_u256Sub(&R_temp, &R_temp, &const_p);
     }
@@ -226,7 +259,6 @@ __device__ __forceinline__ void mul_mod_device(BigInt *res, const BigInt *a, con
     
     copy_bigint(res, &R_temp);
 }
-
 __device__ __forceinline__ void sub_mod_device(BigInt *res, const BigInt *a, const BigInt *b) {
     BigInt temp;
     if (compare_bigint(a, b) < 0) {
