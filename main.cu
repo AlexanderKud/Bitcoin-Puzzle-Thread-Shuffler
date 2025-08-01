@@ -1,4 +1,3 @@
-//Author telegram: https://t.me/nmn5436
 #include "secp256k1.cuh"
 #include <iostream>
 #include <vector>
@@ -1229,9 +1228,125 @@ __device__ __forceinline__ bool compare_hash160_fast(const uint8_t* hash1, const
            (*(uint32_t*)(hash1 + 16) == *(uint32_t*)(hash2 + 16));
 }
 
+
 __device__ volatile int g_found = 0;
-__device__ char g_found_hex[65] = {0};
-__device__ char g_found_hash160[41] = {0};
+__device__ char g_found_hex[65] = {0};        // Original hex
+__device__ char g_found_hash160[41] = {0};    // Hash160 result
+
+// Add pair swap function
+__device__ void binary_pair_swap(char* binary) {
+    int len = d_strlen(binary);
+    
+    // Find the position of the first '1'
+    int first_one_pos = 0;
+    for (int i = 0; i < len; i++) {
+        if (binary[i] == '1') {
+            first_one_pos = i;
+            break;
+        }
+    }
+    
+    // Swap pairs starting after the first '1'
+    // Start from first_one_pos + 1 to preserve the leading bit
+    for (int i = first_one_pos + 1; i < len - 1; i += 2) {
+        char temp = binary[i];
+        binary[i] = binary[i + 1];
+        binary[i + 1] = temp;
+    }
+}
+
+// Add interleave function
+__device__ void binary_interleave(char* binary) {
+    int len = d_strlen(binary);
+    
+    // Find the position of the first '1'
+    int first_one_pos = 0;
+    for (int i = 0; i < len; i++) {
+        if (binary[i] == '1') {
+            first_one_pos = i;
+            break;
+        }
+    }
+    
+    // Work with the part after the first '1'
+    int working_len = len - first_one_pos;
+    if (working_len <= 2) return; // Not enough bits to interleave
+    
+    // Temporary buffer for the result
+    char temp[257];
+    
+    // Copy the leading part (up to and including first '1')
+    for (int i = 0; i <= first_one_pos; i++) {
+        temp[i] = binary[i];
+    }
+    
+    // Calculate mid point for the working section
+    int mid = (working_len - 1) / 2; // -1 because we don't count the first '1'
+    
+    // Interleave the bits: take alternating bits from first and second half
+    int write_pos = first_one_pos + 1;
+    for (int i = 0; i < mid; i++) {
+        temp[write_pos++] = binary[first_one_pos + 1 + i];              // From first half
+        temp[write_pos++] = binary[first_one_pos + 1 + mid + i];        // From second half
+    }
+    
+    // If odd number of bits, append the last bit
+    if ((working_len - 1) % 2 == 1) {
+        temp[write_pos++] = binary[len - 1];
+    }
+    
+    // Copy back to original
+    for (int i = 0; i < len; i++) {
+        binary[i] = temp[i];
+    }
+}
+
+// Add bit shuffle function - shuffles bits in groups of 8
+__device__ void binary_bit_shuffle(char* binary) {
+    int len = d_strlen(binary);
+    
+    // Find the position of the first '1'
+    int first_one_pos = 0;
+    for (int i = 0; i < len; i++) {
+        if (binary[i] == '1') {
+            first_one_pos = i;
+            break;
+        }
+    }
+    
+    // Work with the part after the first '1'
+    int start_pos = first_one_pos + 1;
+    int working_len = len - start_pos;
+    if (working_len < 8) return; // Not enough bits to shuffle
+    
+    // Shuffle pattern: [0,1,2,3,4,5,6,7] -> [3,6,1,4,7,2,5,0]
+    // This pattern ensures good bit mixing
+    const int shuffle_pattern[8] = {3, 6, 1, 4, 7, 2, 5, 0};
+    
+    // Process in groups of 8 bits
+    for (int group_start = start_pos; group_start + 7 < len; group_start += 8) {
+        char temp[8];
+        
+        // Copy current group
+        for (int i = 0; i < 8; i++) {
+            temp[i] = binary[group_start + i];
+        }
+        
+        // Apply shuffle pattern
+        for (int i = 0; i < 8; i++) {
+            binary[group_start + i] = temp[shuffle_pattern[i]];
+        }
+    }
+    
+    // Handle remaining bits (less than 8) with a simple reverse
+    int remaining_start = (working_len / 8) * 8 + start_pos;
+    int remaining_count = len - remaining_start;
+    for (int i = 0; i < remaining_count / 2; i++) {
+        char temp = binary[remaining_start + i];
+        binary[remaining_start + i] = binary[len - 1 - i];
+        binary[len - 1 - i] = temp;
+    }
+}
 
 // Optimization 1: Pre-allocate and reuse more variables
 __global__ void start_optimized(const char* minRangePure, const char* maxRangePure, const char* target) {
@@ -1242,9 +1357,8 @@ __global__ void start_optimized(const char* minRangePure, const char* maxRangePu
     }
     
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int length = d_strlen(minRangePure) * 4;
-    
-    // Move these outside the loop - they don't change
+    int length = ((str_len(minRangePure) - 1) * 4);
+
     char minRange[65];
     leftPad64(minRange, minRangePure);
     char maxRange[65];
@@ -1255,8 +1369,6 @@ __global__ void start_optimized(const char* minRangePure, const char* maxRangePu
     hex_to_bigint(minRange, &min);
     hex_to_bigint(maxRange, &max);
     
-    // Performance tracking variables
-    unsigned long long local_keys_checked = 0;
     
     // Improved seeding with better entropy mixing
     uint64_t seed = clock64();
@@ -1265,8 +1377,8 @@ __global__ void start_optimized(const char* minRangePure, const char* maxRangePu
     seed ^= ((uint64_t)gridDim.x << 48) | ((uint64_t)blockDim.x << 32);
     uint64_t rng_state = mix(seed);
     
-    // Pre-allocate ALL working variables once
-    BigInt random_value, priv2, priv;
+    // Pre-allocate ALL working variables once - avoid repeated allocation overhead
+    BigInt priv2, priv;
     ECPointJac result_jac;
     ECPoint public_key;
     uint8_t pubkey[33];
@@ -1280,128 +1392,112 @@ __global__ void start_optimized(const char* minRangePure, const char* maxRangePu
     uint8_t target_bytes[20];
     hex_string_to_bytes(target, target_bytes, 20);
     
-    // MODIFICATION: Calculate actual bit length from the hex string length
+    // Calculate actual bit length from the hex string length
     int hex_len = d_strlen(maxRangePure);
-    int max_bits = hex_len * 4; // Each hex digit = 4 bits
-    
-    // For more precision, check the first hex digit to adjust bit count
-    if (maxRangePure[0] == '1') {
-        max_bits = (hex_len - 1) * 4 + 1; // 1 = 1 bit
-    } else if (maxRangePure[0] == '2' || maxRangePure[0] == '3') {
-        max_bits = (hex_len - 1) * 4 + 2; // 2-3 = 2 bits
-    } else if (maxRangePure[0] >= '4' && maxRangePure[0] <= '7') {
-        max_bits = (hex_len - 1) * 4 + 3; // 4-7 = 3 bits
-    } else {
-        max_bits = (hex_len - 1) * 4 + 4; // 8-F = 4 bits
-    }
-    
-    // Debug: print calculated bits for first thread
-    if (tid == 0) {
-        printf("Hex range: %s, Length: %d, Calculated max_bits: %d\n", maxRangePure, hex_len, max_bits);
-    }
-    
-    // Ensure we have at least 2 bits (1 for prefix, 1 for variation)
-    if (max_bits < 2) max_bits = 2;
+    int max_ones = (length / 2) + (length / 4); // Maximum number of '1's
+    int min_ones = (length / 2) - (length / 4);     // Minimum number of '1's
     
     // Each thread gets different number of ones
-    int num_ones = (tid % (max_bits - 1)) + 1; // Each thread gets 1 to (max_bits-1) ones
+    int num_ones = min_ones + (tid % (max_ones - min_ones + 1)); // Number of '1's to place
     
-    // Debug info
-    if (tid < 10) {
-        printf("Thread %d: Working with %d ones\n", tid, num_ones);
-    }
+    // Debug info for first few threads
+   // if (tid < 10) {
+        //printf("Thread %d: Binary length=%d, placing %d ones, range: [%d, %d]\n", 
+        //       tid, length, num_ones, min_ones, max_ones);
+    //}
     
     int c = 0;
     while(local_found == 0 && g_found == 0) {
-        // MODIFICATION: Generate binary with fixed number of ones
+        
+        // Generate binary with fixed number of ones
         // Initialize binary string with zeros
         for(int i = 0; i < 256; i++) {
             binary[i] = '0';
         }
-        binary[max_bits] = '\0';
         
-        // Place ones at random positions
-        binary[0] = '1'; // Always start with 1 (prefix)
+        // The binary string format: '1' + [length bits]
+        // Set prefix '1' at position 0
+        binary[0] = '1';
         
-        // Place remaining ones
-        int ones_placed = 1;
-        while(ones_placed < num_ones && ones_placed < max_bits) {
-            // Simple random position
+        // Null terminate after prefix + length bits
+        binary[length + 1] = '\0';
+        
+        // Place num_ones '1's randomly within the length bits (positions 1 to length)
+        int ones_placed = 0;
+        int attempts = 0;
+        const int MAX_ATTEMPTS = length * 10;  // Prevent infinite loops
+        
+        while(ones_placed < num_ones && attempts < MAX_ATTEMPTS) {
+            // Generate random position within the length bits (1 to length inclusive)
             rng_state ^= rng_state << 13;
             rng_state ^= rng_state >> 7;
             rng_state ^= rng_state << 17;
             
-            int pos = 1 + (rng_state % (max_bits - 1));
-            if(pos < max_bits && binary[pos] == '0') {
+            int pos = 1 + (rng_state % length);  // Position from 1 to length
+            
+            if(binary[pos] == '0') {
                 binary[pos] = '1';
                 ones_placed++;
             }
+            attempts++;
         }
         
-        // Convert binary to BigInt
-        binary_to_bigint_direct(binary, &priv2);
-        
-        // Skip if outside range
-        if (compare_bigint(&priv2, &min) < 0 || compare_bigint(&priv2, &max) > 0) {
-            c++;
-            continue;
+        // If we couldn't place all ones randomly (very unlikely), 
+        // fill remaining positions sequentially
+        if(ones_placed < num_ones) {
+            for(int i = 1; i <= length && ones_placed < num_ones; i++) {  // From 1 to length
+                if(binary[i] == '0') {
+                    binary[i] = '1';
+                    ones_placed++;
+                }
+            }
         }
         
-        // Your original transformation loops
+        // Main computation loops
         for(int inv = 0; inv < 2; inv++) {
             for(int z = 0; z < 2; z++) {
-				for(int y = 0; y < length - 4; y++) {
-					for(int x = 0; x < 16; x++) {
-						
-						binary_to_bigint_direct(binary, &priv2);
-						
-						// Inline scalar_mod_n
-						if (compare_bigint(&priv2, &const_n) >= 0) {
-							ptx_u256Sub(&priv, &priv2, &const_n);
-						} else {
-							copy_bigint(&priv, &priv2);
-						}
-						
-						scalar_multiply_jac_device(&result_jac, &const_G_jacobian, &priv);
-						jacobian_to_affine(&public_key, &result_jac);
-						coords_to_compressed_pubkey(public_key.x, public_key.y, pubkey);
-						hash160(pubkey, 33, hash160_out);
-						
-						local_keys_checked++;
-						
-						if(tid == 32 && inv == 0 && z == 0 && x == 0) {
-							hash160_to_hex(hash160_out, hash160_str);
-							char hex_str[65];
-							bigint_to_hex(&priv, hex_str);
-							
-							// Count ones for verification
-							int count = 0;
-							for(int i = 0; i < max_bits; i++) {
-								if(binary[i] == '1') count++;
-							}
-							printf("%d - T%d - %s -> %s -> %s\n", 
-								   c, tid, binary, hex_str, hash160_str);
-						}
-						
-						// Check for match
-						if (compare_hash160_fast(hash160_out, target_bytes)) {
-							if (atomicCAS((int*)&g_found, 0, 1) == 0) {
-								binary_to_hex(binary, temp_hex);
-								hash160_to_hex(hash160_out, hash160_str);
-								
-								memcpy(g_found_hex, temp_hex, 65);
-								memcpy(g_found_hash160, hash160_str, 41);
-								
-								printf("\n*** FOUND! ***\n");
-								printf("Private Key: %s\n", temp_hex);
-								printf("Hash160: %s\n", hash160_str);
-							}
-							local_found = 1;
-							goto exit_loops;
-						}
-						
-						binary_vertical_rotate_up(binary);
-					}
+                for(int y = 0; y < length; y++) {
+
+                    binary_to_bigint_direct(binary, &priv2);
+                    
+                    if (compare_bigint(&priv2, &const_n) >= 0) {
+                        ptx_u256Sub(&priv, &priv2, &const_n);
+                    } else {
+                        copy_bigint(&priv, &priv2);
+                    }
+                    
+                    scalar_multiply_jac_device(&result_jac, &const_G_jacobian, &priv);
+                    jacobian_to_affine(&public_key, &result_jac);
+                    coords_to_compressed_pubkey(public_key.x, public_key.y, pubkey);
+                    hash160(pubkey, 33, hash160_out);
+                    
+                    
+                    // Debug output for specific thread
+                    if(tid == 0 && inv == 0 && z == 0 && y == 0) {
+                        hash160_to_hex(hash160_out, hash160_str);
+                        char hex_str[65];
+                        bigint_to_hex(&priv, hex_str);
+                        printf("%d - %s -> %s -> %s\n", c, binary, hex_str, hash160_str);
+                    }
+                    
+                    // Check if we found the target
+                    if (compare_hash160_fast(hash160_out, target_bytes)) {
+                        if (atomicCAS((int*)&g_found, 0, 1) == 0) {
+                            // Only convert to hex when found
+                            binary_to_hex(binary, temp_hex);
+                            hash160_to_hex(hash160_out, hash160_str);
+                            
+                            memcpy(g_found_hex, temp_hex, 65);
+                            memcpy(g_found_hash160, hash160_str, 41);
+                            
+                            printf("\n*** FOUND! ***\n");
+                            printf("Private Key: %s\n", temp_hex);
+                            printf("Hash160: %s\n", hash160_str);
+                        }
+                        local_found = 1;
+                        goto exit_loops; // Break all nested loops efficiently
+                    }
+                    
                     binary_rotate_left_by_one(binary);
                 }
                 reverseBinaryAfterFirst1(binary);
@@ -1410,7 +1506,10 @@ __global__ void start_optimized(const char* minRangePure, const char* maxRangePu
         }
         exit_loops:;
         c++;
+        
+
     }
+    
 }
 int main(int argc, char* argv[]) {
     if (argc < 4) {
@@ -1419,6 +1518,22 @@ int main(int argc, char* argv[]) {
     }
     
     try {
+		
+        int device_id = (argc >= 7) ? std::stoi(argv[6]) : 0;
+
+        // Check if device exists
+        int device_count = 0;
+        cudaGetDeviceCount(&device_count);
+        if (device_id < 0 || device_id >= device_count) {
+            std::cerr << "Invalid device ID: " << device_id
+                      << ". Available devices: 0 to " << (device_count - 1) << std::endl;
+            return 1;
+        }
+
+        // Set device
+        cudaSetDevice(device_id);
+
+        std::cout << "Using CUDA device " << device_id << std::endl;
         init_gpu_constants();
         
         // Allocate device memory for 3 strings
@@ -1442,13 +1557,10 @@ int main(int argc, char* argv[]) {
         // Parse grid configuration
         int blocks = (argc >= 5) ? std::stoi(argv[4]) : 32;
         int threads = (argc >= 6) ? std::stoi(argv[5]) : 32;
-        int device = (argc >= 7) ? std::stoi(argv[6]) : 0;
-		printf("device ID: %d\n", device);
-		cudaSetDevice(device);
+        
         printf("Launching with %d blocks and %d threads\nTotal parallel threads: %d\n\n", 
                blocks, threads, blocks * threads);
         
-		printf("If you liked the program, please donate BTC: bc1p6fmhpep0wkqkzvw86fg0afz85fyw692vmcg05460yuqstva7qscs2d9xhk\nAuthor telegram: https://t.me/nmn5436 \n\n");
         // Launch kernel
         start_optimized<<<blocks, threads>>>(d_param1, d_param2, d_param3);
         
@@ -1507,5 +1619,3 @@ int main(int argc, char* argv[]) {
     
     return 0;
 }
-
-//Author telegram: https://t.me/nmn5436
